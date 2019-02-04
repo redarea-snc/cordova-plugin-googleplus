@@ -3,28 +3,26 @@ package nl.xservices.plugins;
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.accounts.AccountManagerFuture;
-import android.accounts.AuthenticatorException;
-import android.accounts.OperationCanceledException;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.os.AsyncTask;
 import android.os.Bundle;
+import android.support.annotation.NonNull;
 import android.util.Log;
 
-import com.google.android.gms.auth.api.Auth;
-import com.google.android.gms.auth.api.signin.GoogleSignInResult;
+import com.google.android.gms.auth.api.signin.GoogleSignIn;
+import com.google.android.gms.auth.api.signin.GoogleSignInClient;
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
-import com.google.android.gms.common.ConnectionResult;
-import com.google.android.gms.common.api.GoogleApiClient;
-import com.google.android.gms.common.api.ResultCallback;
-import com.google.android.gms.common.api.Status;
+import com.google.android.gms.common.api.ApiException;
 import com.google.android.gms.common.api.Scope;
 
+import com.google.android.gms.tasks.OnCanceledListener;
+import com.google.android.gms.tasks.OnCompleteListener;
+import com.google.android.gms.tasks.OnFailureListener;
+import com.google.android.gms.tasks.Task;
 import org.apache.cordova.*;
-import org.apache.cordova.engine.SystemWebChromeClient;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -36,13 +34,16 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
+
 import android.content.pm.Signature;
 
 /**
  * Originally written by Eddy Verbruggen (http://github.com/EddyVerbruggen/cordova-plugin-googleplus)
  * Forked/Duplicated and Modified by PointSource, LLC, 2016.
  */
-public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConnectionFailedListener {
+public class GooglePlus extends CordovaPlugin {
 
     public static final String ACTION_IS_AVAILABLE = "isAvailable";
     public static final String ACTION_LOGIN = "login";
@@ -63,12 +64,21 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
     public static final String ARGUMENT_HOSTED_DOMAIN = "hostedDomain";
 
     public static final String TAG = "GooglePlugin";
-    public static final int RC_GOOGLEPLUS = 1552; // Request Code to identify our plugin's activities
+    public static final int RC_GOOGLESIGNIN = 77552; // Request Code to identify our plugin's activities
     public static final int KAssumeStaleTokenSec = 60;
 
     // Wraps our service connection to Google Play services and provides access to the users sign in state and Google APIs
-    private GoogleApiClient mGoogleApiClient;
+    private GoogleSignInClient mGoogleSignInClient;
     private CallbackContext savedCallbackContext;
+
+    // Scopes needed to be granted
+    private List<Scope> requestedScopes;
+    // Last web client id used to build GoogleSignInClient
+    private String mWebClientId;
+    // Last hosted domain used to build GoogleSignInClient
+    private String mHostedDomain;
+    // Last offline access configuration used to build GoogleSignInClient
+    private boolean mOfflineAccess;
 
     @Override
     public void initialize(CordovaInterface cordova, CordovaWebView webView) {
@@ -82,22 +92,14 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
         if (ACTION_IS_AVAILABLE.equals(action)) {
             final boolean avail = true;
             savedCallbackContext.success("" + avail);
-
         } else if (ACTION_LOGIN.equals(action)) {
-            //pass args into api client build
-            buildGoogleApiClient(args.optJSONObject(0));
-
             // Tries to Log the user in
             Log.i(TAG, "Trying to Log in!");
-            cordova.setActivityResultCallback(this); //sets this class instance to be an activity result listener
-            signIn();
+            checkGoogleSignInClient(args.optJSONObject(0), action);
 
         } else if (ACTION_TRY_SILENT_LOGIN.equals(action)) {
-            //pass args into api client build
-            buildGoogleApiClient(args.optJSONObject(0));
-
             Log.i(TAG, "Trying to do silent login!");
-            trySilentLogin();
+            checkGoogleSignInClient(args.optJSONObject(0), action);
 
         } else if (ACTION_LOGOUT.equals(action)) {
             Log.i(TAG, "Trying to logout!");
@@ -118,160 +120,274 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
         return true;
     }
 
+    private void buildGoogleSignInClient(String actionExecuted){
+        if(mGoogleSignInClient == null){
+            Log.i(TAG, "Building Google options");
+
+            //2019-02-01 - According to this piece of documentation: https://developers.google.com/identity/sign-in/android/people ,
+            // requestProfile is already included in GoogleSignInOptions.DEFAULT_SIGN_IN
+            GoogleSignInOptions.Builder gsoBuilder = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN).requestEmail();
+            if(requestedScopes.size() > 0){
+                for(Scope scope: requestedScopes){
+                    gsoBuilder.requestScopes(scope);
+                }
+            }
+
+            if(mWebClientId != null){
+                if(mOfflineAccess){
+                    gsoBuilder.requestServerAuthCode(mWebClientId, true);
+                }
+                else{
+                    gsoBuilder.requestIdToken(mWebClientId);
+                }
+            }
+            GoogleSignInOptions gso = gsoBuilder.build();
+
+            mGoogleSignInClient = GoogleSignIn.getClient(cordova.getActivity(), gso);
+        }
+
+
+        if(ACTION_TRY_SILENT_LOGIN.equals(actionExecuted)){
+            Task<GoogleSignInAccount> task = mGoogleSignInClient.silentSignIn();
+            handleSignInResult(task, ACTION_TRY_SILENT_LOGIN);
+        }
+        else{
+            // Force user login interface
+            Intent signInIntent = mGoogleSignInClient.getSignInIntent();
+            cordova.startActivityForResult(this, signInIntent, RC_GOOGLESIGNIN);
+        }
+    }
+
     /**
-     * Set options for login and Build the GoogleApiClient if it has not already been built.
-     * @param clientOptions - the options object passed in the login function
+     * Rut Bastoni - 2019-02-01 - new Google Sign in flow
+     * @see https://developers.google.com/identity/sign-in/android/start-integrating
+     * @see https://android-developers.googleblog.com/2017/11/moving-past-googleapiclient_21.html for migrating away from GoogleApiClient
+     * @param clientOptions
      */
-    private synchronized void buildGoogleApiClient(JSONObject clientOptions) throws JSONException {
-        if (clientOptions == null) {
+    private synchronized void checkGoogleSignInClient(JSONObject clientOptions, String actionExecuted) {
+        List<Scope> previousRequestedScopes = requestedScopes;
+        requestedScopes = new ArrayList<>();
+
+        String webClientId = null;
+        // Try to get hosted domain
+        String hostedDomain = null;
+        boolean offlineAccess = false;
+        // Check if this call has more scopes than previous requests
+        boolean hasExtraScopes = false;
+        if(clientOptions != null){
+            // Set requested scopes - can be different among different login execution, if the application needs to request
+            // incremental scopes
+            String scopes = clientOptions.optString(ARGUMENT_SCOPES, null);
+
+            if (scopes != null && !scopes.isEmpty()) {
+                // We have a string of scopes passed in. Split by space and request
+                for (String scope : scopes.split(" ")) {
+                    if(!scope.isEmpty()){
+                        requestedScopes.add(new Scope(scope));
+
+                        if(previousRequestedScopes != null && !previousRequestedScopes.contains(scope)){
+                            hasExtraScopes = true;
+                        }
+                    }
+                }
+            }
+
+            // Try to get web client id
+            webClientId = clientOptions.optString(ARGUMENT_WEB_CLIENT_ID, null);
+            if(webClientId != null && webClientId.isEmpty()){
+                webClientId = null;
+            }
+            else{
+                // Can have offlineAccess only with clientId
+                offlineAccess = clientOptions.optBoolean(ARGUMENT_OFFLINE_KEY, false);
+            }
+
+
+            // Try to get hosted domain, if any
+            hostedDomain = clientOptions.optString(ARGUMENT_HOSTED_DOMAIN, null);
+            if(hostedDomain != null && hostedDomain.isEmpty()){
+                hostedDomain = null;
+            }
+        }
+
+        String previousWebClientId = mWebClientId;
+        String previousHostedDomain = mHostedDomain;
+        boolean previousOfflineAccess = mOfflineAccess;
+
+        mWebClientId = webClientId;
+        mHostedDomain = hostedDomain;
+        mOfflineAccess = offlineAccess;
+
+        // If webClientId or hostedDomain changed, should sign out and get a new client
+        if (
+                mGoogleSignInClient != null
+                        && (
+                        hasExtraScopes ||
+                                (mWebClientId != null && !mWebClientId.equals(previousWebClientId))
+                                || (
+                                (mHostedDomain != null && !mHostedDomain.equals(previousHostedDomain))
+                                        || (mHostedDomain == null && previousHostedDomain != null)
+                        )
+                                || (!previousOfflineAccess && mOfflineAccess)
+                )
+        ){
+
+            mGoogleSignInClient
+                    .signOut()
+                    .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<Void>() {
+                        @Override
+                        public void onComplete(@NonNull Task<Void> task) {
+                            mGoogleSignInClient = null;
+                            buildGoogleSignInClient(actionExecuted);
+                        }
+                    })
+                    .addOnFailureListener(cordova.getActivity(), new OnFailureListener() {
+                        @Override
+                        public void onFailure(@NonNull Exception e) {
+                            Log.e(TAG, e.getMessage());
+                            e.printStackTrace();
+
+                            savedCallbackContext.error(e.getMessage());
+                        }
+                    })
+                    .addOnCanceledListener(cordova.getActivity(), new OnCanceledListener() {
+                        @Override
+                        public void onCanceled() {
+                            String msg = "Building new GoogleSignInClient failed - was canceled";
+                            Log.e(TAG, msg);
+                            savedCallbackContext.error(msg);
+                        }
+                    });
             return;
         }
 
-        //If options have been passed in, they could be different, so force a rebuild of the client
-        // disconnect old client iff it exists
-        if (this.mGoogleApiClient != null) this.mGoogleApiClient.disconnect();
-        // nullify
-        this.mGoogleApiClient = null;
-
-        Log.i(TAG, "Building Google options");
-
-        // Make our SignIn Options builder.
-        GoogleSignInOptions.Builder gso = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN);
-
-        // request the default scopes
-        gso.requestEmail().requestProfile();
-
-        // We're building the scopes on the Options object instead of the API Client
-        // b/c of what was said under the "addScope" method here:
-        // https://developers.google.com/android/reference/com/google/android/gms/common/api/GoogleApiClient.Builder.html#public-methods
-        String scopes = clientOptions.optString(ARGUMENT_SCOPES, null);
-
-        if (scopes != null && !scopes.isEmpty()) {
-            // We have a string of scopes passed in. Split by space and request
-            for (String scope : scopes.split(" ")) {
-                gso.requestScopes(new Scope(scope));
-            }
-        }
-
-        // Try to get web client id
-        String webClientId = clientOptions.optString(ARGUMENT_WEB_CLIENT_ID, null);
-
-        // if webClientId included, we'll request an idToken
-        if (webClientId != null && !webClientId.isEmpty()) {
-            gso.requestIdToken(webClientId);
-
-            // if webClientId is included AND offline is true, we'll request the serverAuthCode
-            if (clientOptions.optBoolean(ARGUMENT_OFFLINE_KEY, false)) {
-                gso.requestServerAuthCode(webClientId, true);
-            }
-        }
-
-        // Try to get hosted domain
-        String hostedDomain = clientOptions.optString(ARGUMENT_HOSTED_DOMAIN, null);
-
-        // if hostedDomain included, we'll request a hosted domain account
-        if (hostedDomain != null && !hostedDomain.isEmpty()) {
-            gso.setHostedDomain(hostedDomain);
-        }
-
-        //Now that we have our options, let's build our Client
-        Log.i(TAG, "Building GoogleApiClient");
-
-        GoogleApiClient.Builder builder = new GoogleApiClient.Builder(webView.getContext())
-            .addOnConnectionFailedListener(this)
-            .addApi(Auth.GOOGLE_SIGN_IN_API, gso.build());
-
-        this.mGoogleApiClient = builder.build();
-
-        Log.i(TAG, "GoogleApiClient built");
-    }
-
-    // The Following functions were implemented in reference to Google's example here:
-    // https://github.com/googlesamples/google-services/blob/master/android/signin/app/src/main/java/com/google/samples/quickstart/signin/SignInActivity.java
-
-    /**
-     * Starts the sign in flow with a new Intent, which should respond to our activity listener here.
-     */
-    private void signIn() {
-        Intent signInIntent = Auth.GoogleSignInApi.getSignInIntent(this.mGoogleApiClient);
-        cordova.getActivity().startActivityForResult(signInIntent, RC_GOOGLEPLUS);
+        buildGoogleSignInClient(actionExecuted);
     }
 
     /**
-     * Tries to log the user in silently using existing sign in result information
+     * Function for handling the sign in result
+     * Handles the result of the authentication workflow.
+     *
+     * If the sign in was successful, we build and return an object containing the users email, id, displayname,
+     * id token, and (optionally) the server authcode.
+     *
+     * If sign in was not successful, for some reason, we return the status code to web app to be handled.
+     * Some important Status Codes:
+     *      SIGN_IN_CANCELLED = 12501 -> cancelled by the user, flow exited, oauth consent denied
+     *      SIGN_IN_FAILED = 12500 -> sign in attempt didn't succeed with the current account
+     *      SIGN_IN_REQUIRED = 4 -> Sign in is needed to access API but the user is not signed in
+     *      INTERNAL_ERROR = 8
+     *      NETWORK_ERROR = 7
+     *
+     * @param completedTask
+     * @param action
      */
-    private void trySilentLogin() {
-        ConnectionResult apiConnect =  mGoogleApiClient.blockingConnect();
-
-        if (apiConnect.isSuccess()) {
-            handleSignInResult(Auth.GoogleSignInApi.silentSignIn(this.mGoogleApiClient).await());
+    private void handleSignInResult(Task<GoogleSignInAccount> completedTask, String action) {
+        if(completedTask.isSuccessful()){
+            // There's immediate result available.
+            GoogleSignInAccount signInAccount = completedTask.getResult();
+            loginSuccess(signInAccount);
         }
+        else{
+            // There's no immediate result ready, waits for the async callback.
+            completedTask
+                    .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<GoogleSignInAccount>() {
+                        @Override
+                        public void onComplete(@NonNull Task<GoogleSignInAccount> task) {
+                            try{
+                                GoogleSignInAccount signInAccount = task.getResult(ApiException.class);
+                                loginSuccess(signInAccount);
+                            }catch (ApiException apiException){
+                                // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
+                                savedCallbackContext.error(apiException.getStatusCode());
+                            }
+
+                        }
+                    })
+                    .addOnCanceledListener(cordova.getActivity(), new OnCanceledListener() {
+                        @Override
+                        public void onCanceled() {
+                            String msg = "GoogleSignInClient " + action + " failed - was canceled";
+                            Log.e(TAG, msg);
+                            savedCallbackContext.error(msg);
+                        }
+                    });
+        }
+    }
+
+    private void loginSuccess(GoogleSignInAccount googleSignInAccount){
+        JSONObject result = new JSONObject();
+        try{
+            //--04/02/2019 - Rut Bastoni - It's not recommended to perform backend server authentication here, it should
+            // send idToken/serverAuthCode and let the server do it for you like explained in here: https://developers.google.com/identity/sign-in/android/backend-auth#using-a-google-api-client-library
+            // Anyway, it's possible to do it with Google API Client Library, if needed
+//            JSONObject accessTokenBundle = getAuthToken(
+//                    cordova.getActivity(), googleSignInAccount.getAccount(), true
+//            );
+            result.put("email", googleSignInAccount.getEmail());
+            result.put("idToken", googleSignInAccount.getIdToken());
+            result.put("serverAuthCode", googleSignInAccount.getServerAuthCode());
+            result.put("userId", googleSignInAccount.getId());
+            result.put("displayName", googleSignInAccount.getDisplayName());
+            result.put("familyName", googleSignInAccount.getFamilyName());
+            result.put("givenName", googleSignInAccount.getGivenName());
+            result.put("imageUrl", googleSignInAccount.getPhotoUrl());
+            savedCallbackContext.success(result);
+        }catch (JSONException e){
+            savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
+        }
+
     }
 
     /**
      * Signs the user out from the client
      */
     private void signOut() {
-        if (this.mGoogleApiClient == null) {
+        if (this.mGoogleSignInClient == null) {
             savedCallbackContext.error("Please use login or trySilentLogin before logging out");
             return;
         }
 
-        ConnectionResult apiConnect = mGoogleApiClient.blockingConnect();
-
-        if (apiConnect.isSuccess()) {
-            Auth.GoogleSignInApi.signOut(this.mGoogleApiClient).setResultCallback(
-                    new ResultCallback<Status>() {
-                        @Override
-                        public void onResult(Status status) {
-                            //on success, tell cordova
-                            if (status.isSuccess()) {
-                                savedCallbackContext.success("Logged user out");
-                            } else {
-                                savedCallbackContext.error(status.getStatusCode());
-                            }
+        mGoogleSignInClient
+                .signOut()
+                .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<Void>() {
+                    @Override
+                    public void onComplete(@NonNull Task<Void> task) {
+                        try{
+                            task.getResult(ApiException.class);
+                            savedCallbackContext.success("Logged user out");
+                        }catch (ApiException apiException){
+                            // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
+                            savedCallbackContext.error(apiException.getStatusCode());
                         }
+
                     }
-            );
-        }
+                });
     }
 
     /**
      * Disconnects the user and revokes access
      */
     private void disconnect() {
-        if (this.mGoogleApiClient == null) {
+        if (this.mGoogleSignInClient == null) {
             savedCallbackContext.error("Please use login or trySilentLogin before disconnecting");
             return;
         }
 
-        ConnectionResult apiConnect = mGoogleApiClient.blockingConnect();
-
-        if (apiConnect.isSuccess()) {
-            Auth.GoogleSignInApi.revokeAccess(this.mGoogleApiClient).setResultCallback(
-                    new ResultCallback<Status>() {
-                        @Override
-                        public void onResult(Status status) {
-                            if (status.isSuccess()) {
-                                savedCallbackContext.success("Disconnected user");
-                            } else {
-                                savedCallbackContext.error(status.getStatusCode());
-                            }
+        mGoogleSignInClient
+                .revokeAccess()
+                .addOnCompleteListener(cordova.getActivity(), new OnCompleteListener<Void>() {
+                    @Override
+                    public void onComplete(@NonNull Task<Void> task) {
+                        try{
+                            task.getResult(ApiException.class);
+                            savedCallbackContext.success("Disconnected user");
+                        }catch (ApiException apiException){
+                            // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
+                            savedCallbackContext.error(apiException.getStatusCode());
                         }
                     }
-            );
-        }
-    }
-
-    /**
-     * Handles failure in connecting to google apis.
-     *
-     * @param result is the ConnectionResult to potentially catch
-     */
-    @Override
-    public void onConnectionFailed(ConnectionResult result) {
-        Log.i(TAG, "Unresolvable failure in connecting to Google APIs");
-        savedCallbackContext.error(result.getErrorCode());
+                });
     }
 
     /**
@@ -290,79 +406,13 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
 
         Log.i(TAG, "In onActivityResult");
 
-        if (requestCode == RC_GOOGLEPLUS) {
+        if (requestCode == RC_GOOGLESIGNIN) {
             Log.i(TAG, "One of our activities finished up");
-            //Call handleSignInResult passing in sign in result object
-            handleSignInResult(Auth.GoogleSignInApi.getSignInResultFromIntent(intent));
+            Task<GoogleSignInAccount> task = GoogleSignIn.getSignedInAccountFromIntent(intent);
+            handleSignInResult(task, ACTION_LOGIN);
         }
         else {
             Log.i(TAG, "This wasn't one of our activities");
-        }
-    }
-
-    /**
-     * Function for handling the sign in result
-     * Handles the result of the authentication workflow.
-     *
-     * If the sign in was successful, we build and return an object containing the users email, id, displayname,
-     * id token, and (optionally) the server authcode.
-     *
-     * If sign in was not successful, for some reason, we return the status code to web app to be handled.
-     * Some important Status Codes:
-     *      SIGN_IN_CANCELLED = 12501 -> cancelled by the user, flow exited, oauth consent denied
-     *      SIGN_IN_FAILED = 12500 -> sign in attempt didn't succeed with the current account
-     *      SIGN_IN_REQUIRED = 4 -> Sign in is needed to access API but the user is not signed in
-     *      INTERNAL_ERROR = 8
-     *      NETWORK_ERROR = 7
-     *
-     * @param signInResult - the GoogleSignInResult object retrieved in the onActivityResult method.
-     */
-    private void handleSignInResult(final GoogleSignInResult signInResult) {
-        if (this.mGoogleApiClient == null) {
-            savedCallbackContext.error("GoogleApiClient was never initialized");
-            return;
-        }
-
-        if (signInResult == null) {
-          savedCallbackContext.error("SignInResult is null");
-          return;
-        }
-
-        Log.i(TAG, "Handling SignIn Result");
-
-        if (!signInResult.isSuccess()) {
-            Log.i(TAG, "Wasn't signed in");
-
-            //Return the status code to be handled client side
-            savedCallbackContext.error(signInResult.getStatus().getStatusCode());
-        } else {
-            new AsyncTask<Void, Void, Void>() {
-                @Override
-                protected Void doInBackground(Void... params) {
-                    GoogleSignInAccount acct = signInResult.getSignInAccount();
-                    JSONObject result = new JSONObject();
-                    try {
-                        JSONObject accessTokenBundle = getAuthToken(
-                            cordova.getActivity(), acct.getAccount(), true
-                        );
-                        result.put(FIELD_ACCESS_TOKEN, accessTokenBundle.get(FIELD_ACCESS_TOKEN));
-                        result.put(FIELD_TOKEN_EXPIRES, accessTokenBundle.get(FIELD_TOKEN_EXPIRES));
-                        result.put(FIELD_TOKEN_EXPIRES_IN, accessTokenBundle.get(FIELD_TOKEN_EXPIRES_IN));
-                        result.put("email", acct.getEmail());
-                        result.put("idToken", acct.getIdToken());
-                        result.put("serverAuthCode", acct.getServerAuthCode());
-                        result.put("userId", acct.getId());
-                        result.put("displayName", acct.getDisplayName());
-                        result.put("familyName", acct.getFamilyName());
-                        result.put("givenName", acct.getGivenName());
-                        result.put("imageUrl", acct.getPhotoUrl());
-                        savedCallbackContext.success(result);
-                    } catch (Exception e) {
-                        savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
-                    }
-                    return null;
-                }
-            }.execute();
         }
     }
 
@@ -420,7 +470,7 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
         HttpURLConnection urlConnection = (HttpURLConnection) url.openConnection();
         urlConnection.setInstanceFollowRedirects(true);
         String stringResponse = fromStream(
-            new BufferedInputStream(urlConnection.getInputStream())
+                new BufferedInputStream(urlConnection.getInputStream())
         );
         /* expecting:
         {
@@ -434,7 +484,7 @@ public class GooglePlus extends CordovaPlugin implements GoogleApiClient.OnConne
 
         Log.d("AuthenticatedBackend", "token: " + authToken + ", verification: " + stringResponse);
         JSONObject jsonResponse = new JSONObject(
-            stringResponse
+                stringResponse
         );
         int expires_in = jsonResponse.getInt(FIELD_TOKEN_EXPIRES_IN);
         if (expires_in < KAssumeStaleTokenSec) {
