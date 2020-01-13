@@ -91,7 +91,9 @@ public class GooglePlus extends CordovaPlugin {
 
         if (ACTION_IS_AVAILABLE.equals(action)) {
             final boolean avail = true;
-            savedCallbackContext.success("" + avail);
+            if(savedCallbackContext != null){
+                savedCallbackContext.success("" + avail);
+            }
         } else if (ACTION_LOGIN.equals(action)) {
             // Tries to Log the user in
             Log.i(TAG, "Trying to Log in!");
@@ -118,6 +120,17 @@ public class GooglePlus extends CordovaPlugin {
 
         }
         return true;
+    }
+
+    /**
+     * Rut - 13/01/2020 - ci sono errori registrati dove la saved callback si perde - per ora non importa gestire la situazione,
+     * ma intanto si lascia la variabile inzializzata così da non avere dei crash
+     * @param state             Bundle containing the state of the plugin
+     * @param callbackContext   Replacement Context to return the plugin result to
+     */
+    @Override
+    public void onRestoreStateForActivityResult(Bundle state, CallbackContext callbackContext) {
+        this.savedCallbackContext = callbackContext;
     }
 
     private void buildGoogleSignInClient(String actionExecuted){
@@ -247,7 +260,9 @@ public class GooglePlus extends CordovaPlugin {
                             Log.e(TAG, e.getMessage());
                             e.printStackTrace();
 
-                            savedCallbackContext.error(e.getMessage());
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.error(e.getMessage());
+                            }
                         }
                     })
                     .addOnCanceledListener(cordova.getActivity(), new OnCanceledListener() {
@@ -255,7 +270,9 @@ public class GooglePlus extends CordovaPlugin {
                         public void onCanceled() {
                             String msg = "Building new GoogleSignInClient failed - was canceled";
                             Log.e(TAG, msg);
-                            savedCallbackContext.error(msg);
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.error(msg);
+                            }
                         }
                     });
             return;
@@ -299,7 +316,9 @@ public class GooglePlus extends CordovaPlugin {
                                 loginSuccess(signInAccount);
                             }catch (ApiException apiException){
                                 // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
-                                savedCallbackContext.error(apiException.getStatusCode());
+                                if(savedCallbackContext != null){
+                                    savedCallbackContext.error(apiException.getStatusCode());
+                                }
                             }
 
                         }
@@ -309,7 +328,9 @@ public class GooglePlus extends CordovaPlugin {
                         public void onCanceled() {
                             String msg = "GoogleSignInClient " + action + " failed - was canceled";
                             Log.e(TAG, msg);
-                            savedCallbackContext.error(msg);
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.error(msg);
+                            }
                         }
                     });
         }
@@ -332,9 +353,13 @@ public class GooglePlus extends CordovaPlugin {
             result.put("familyName", googleSignInAccount.getFamilyName());
             result.put("givenName", googleSignInAccount.getGivenName());
             result.put("imageUrl", googleSignInAccount.getPhotoUrl());
-            savedCallbackContext.success(result);
+            if(savedCallbackContext != null){
+                savedCallbackContext.success(result);
+            }
         }catch (JSONException e){
-            savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
+            if(savedCallbackContext != null){
+                savedCallbackContext.error("Trouble obtaining result, error: " + e.getMessage());
+            }
         }
 
     }
@@ -344,7 +369,9 @@ public class GooglePlus extends CordovaPlugin {
      */
     private void signOut() {
         if (this.mGoogleSignInClient == null) {
-            savedCallbackContext.error("Please use login or trySilentLogin before logging out");
+            if(savedCallbackContext != null){
+                savedCallbackContext.error("Please use login or trySilentLogin before logging out");
+            }
             return;
         }
 
@@ -355,10 +382,14 @@ public class GooglePlus extends CordovaPlugin {
                     public void onComplete(@NonNull Task<Void> task) {
                         try{
                             task.getResult(ApiException.class);
-                            savedCallbackContext.success("Logged user out");
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.success("Logged user out");
+                            }
                         }catch (ApiException apiException){
                             // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
-                            savedCallbackContext.error(apiException.getStatusCode());
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.error(apiException.getStatusCode());
+                            }
                         }
 
                     }
@@ -370,7 +401,9 @@ public class GooglePlus extends CordovaPlugin {
      */
     private void disconnect() {
         if (this.mGoogleSignInClient == null) {
-            savedCallbackContext.error("Please use login or trySilentLogin before disconnecting");
+            if(savedCallbackContext != null){
+                savedCallbackContext.error("Please use login or trySilentLogin before disconnecting");
+            }
             return;
         }
 
@@ -381,10 +414,14 @@ public class GooglePlus extends CordovaPlugin {
                     public void onComplete(@NonNull Task<Void> task) {
                         try{
                             task.getResult(ApiException.class);
-                            savedCallbackContext.success("Disconnected user");
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.success("Disconnected user");
+                            }
                         }catch (ApiException apiException){
                             // For a list of available status codes: https://developers.google.com/android/reference/com/google/android/gms/common/api/CommonStatusCodes
-                            savedCallbackContext.error(apiException.getStatusCode());
+                            if(savedCallbackContext != null){
+                                savedCallbackContext.error(apiException.getStatusCode());
+                            }
                         }
                     }
                 });
@@ -440,11 +477,15 @@ public class GooglePlus extends CordovaPlugin {
             // strip the last ':'
             strResult = strResult.substring(0, strResult.length()-1);
             strResult = strResult.toUpperCase();
-            this.savedCallbackContext.success(strResult);
+            if(savedCallbackContext != null){
+                this.savedCallbackContext.success(strResult);
+            }
 
         } catch (Exception e) {
             e.printStackTrace();
-            savedCallbackContext.error(e.getMessage());
+            if(savedCallbackContext != null){
+                savedCallbackContext.error(e.getMessage());
+            }
         }
     }
 
